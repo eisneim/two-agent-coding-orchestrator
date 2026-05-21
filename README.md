@@ -53,6 +53,29 @@ Terminal A (纯 shell, 无 Claude)
 
 监工主动在合适时机（~50 轮 / 大型 milestone 前）触发 `orch-compact`，命令工人写入 checkpoint.md（工人当前心智模型），然后对工人执行 `/compact`，compact 后验证恢复。工人丢掉的上下文由 checkpoint.md 补回来。
 
+## 前置准备
+
+你需要先装好这些（缺一不可）：
+
+```bash
+# 1. tmux — macOS 用 Homebrew，Linux 用包管理器
+brew install tmux        # macOS
+sudo apt install tmux    # Ubuntu/Debian
+
+# 2. Claude Code CLI（npm 全局安装）
+npm install -g @anthropic-ai/claude-code
+
+# 3. Python 3.8+（macOS 通常已自带）
+python3 --version
+```
+
+装好以后验证：
+
+```bash
+tmux -V           # 比如 tmux 3.4
+claude --version  # 比如 2.1.142
+```
+
 ## 安装
 
 ```bash
