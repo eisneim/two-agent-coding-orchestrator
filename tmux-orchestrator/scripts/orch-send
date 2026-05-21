@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""
+orch-send — Reliably submit a prompt to a Claude Code worker in tmux.
+
+Solves the long-prompt-not-submitting bug (findings.md §10.1) by:
+  1. Sending the text
+  2. Sleeping ~1s for tmux/UI to settle
+  3. Sending Enter
+  4. Polling status: if state stays IDLE and the bottom bar still says
+     "? for shortcuts" after ~2s, send Enter again (up to 2 retries)
+
+Returns a JSON ack with marker_before so the orchestrator can later
+detect COMPLETED vs INTERRUPTED by diffing last_completion_hash.
+
+PRE-CONDITION: caller must ensure the worker's input box is EMPTY.
+We do not auto-clear because clearing a real interrupted prompt is
+destructive. Run `orch-esc <target> --clear-input` first if unsure.
+Typical use:
+  • after orch-wait-completion returned COMPLETED → input is empty, safe
+  • after orch-wait-completion returned INTERRUPTED → caller's choice
+    to resend or skip; orch-esc clears before retry
+
+Usage:
+    orch-send <target> --text "the prompt"
+    orch-send <target> --prompt-file path/to/prompt.md
+
+Exit codes:
+    0  prompt was submitted (state turned BUSY at least once, OR worker
+       had auto-completed before we noticed)
+    3  failed to submit after retries (state never left IDLE)
+    others same as orch-status
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ORCH_STATUS = os.path.join(HERE, "orch-status")
+
+
+def get_status(target: str) -> dict:
+    out = subprocess.run(
+        [ORCH_STATUS, target], check=True, capture_output=True, text=True
+    )
+    return json.loads(out.stdout)
+
+
+def tmux_send(target: str, *args: str) -> None:
+    subprocess.run(["tmux", "send-keys", "-t", target, *args], check=True)
+
+
+def submit(target: str, text: str) -> dict:
+    """Submit text + Enter with verify+retry."""
+    pre = get_status(target)
+
+    # Auto-dismiss feedback dialog if present (findings.md §12).
+    # The dialog intercepts the next keystroke, so we must clear it
+    # before our prompt or our first character will be eaten.
+    dismiss_attempts = 0
+    while pre.get("dialog_present") and dismiss_attempts < 3:
+        # Send '0' (Dismiss) without Enter — single keypress is enough.
+        tmux_send(target, "0")
+        time.sleep(0.7)
+        pre = get_status(target)
+        dismiss_attempts += 1
+    if pre.get("dialog_present"):
+        return {
+            "ok": False,
+            "error": "dialog_not_dismissed",
+            "state": pre["state"],
+        }
+
+    marker_before = pre.get("last_completion_hash")
+    if pre["state"] != "IDLE":
+        return {
+            "ok": False,
+            "error": "worker_not_idle",
+            "state": pre["state"],
+            "marker_before": marker_before,
+        }
+
+    # 1. Send text
+    tmux_send(target, text)
+    time.sleep(1.0)
+
+    # 2. Send Enter, up to 3 attempts
+    submitted = False
+    attempts = 0
+    for attempt in range(1, 4):
+        attempts = attempt
+        tmux_send(target, "Enter")
+        # Give the worker a chance to flip BUSY
+        for _ in range(8):  # 8 * 0.25s = 2s
+            time.sleep(0.25)
+            st = get_status(target)
+            if st["state"] == "BUSY":
+                submitted = True
+                break
+            # If it already finished an extremely fast turn, marker_hash will
+            # have changed and state is IDLE — count that as success too.
+            if st.get("last_completion_hash") and st["last_completion_hash"] != marker_before:
+                submitted = True
+                break
+        if submitted:
+            break
+
+    if not submitted:
+        return {
+            "ok": False,
+            "error": "enter_not_accepted",
+            "attempts": attempts,
+            "marker_before": marker_before,
+        }
+
+    return {
+        "ok": True,
+        "attempts": attempts,
+        "marker_before": marker_before,
+    }
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog="orch-send")
+    p.add_argument("target", help="tmux session/target")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--text", help="prompt text")
+    g.add_argument("--prompt-file", help="path to file containing prompt")
+    args = p.parse_args(argv[1:])
+
+    if args.prompt_file:
+        with open(args.prompt_file, encoding="utf-8") as f:
+            text = f.read().rstrip("\n")
+    else:
+        text = args.text
+
+    if not text.strip():
+        print(json.dumps({"ok": False, "error": "empty_prompt"}))
+        sys.exit(2)
+
+    result = submit(args.target, text)
+    print(json.dumps(result, ensure_ascii=False))
+    if not result.get("ok"):
+        sys.exit(3)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

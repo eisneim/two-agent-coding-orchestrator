@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""
+orch-esc — Send Escape to a Claude Code worker.
+
+Two distinct uses:
+  1. Interrupt a BUSY worker (single Escape stops generation)
+  2. Clear an existing prompt that's sitting in the input box
+     (requires double Escape: first shows "Esc again to clear",
+      second actually clears)
+
+Usage:
+    orch-esc <target>                   # auto-decide based on state
+    orch-esc <target> --interrupt       # force single ESC (for BUSY)
+    orch-esc <target> --clear-input     # force double ESC (for IDLE w/ prompt)
+
+Default behavior (`auto`):
+  - If state == BUSY: single ESC, then verify state turned IDLE
+  - If state == IDLE: double ESC (with intermediate WAIT_ESC check),
+                      verify the input box returns to plain "? for shortcuts"
+
+Returns JSON ack.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ORCH_STATUS = os.path.join(HERE, "orch-status")
+
+
+def get_status(target: str) -> dict:
+    out = subprocess.run(
+        [ORCH_STATUS, target], check=True, capture_output=True, text=True
+    )
+    return json.loads(out.stdout)
+
+
+def tmux_send(target: str, *args: str) -> None:
+    subprocess.run(["tmux", "send-keys", "-t", target, *args], check=True)
+
+
+def interrupt(target: str) -> dict:
+    pre = get_status(target)
+    if pre["state"] != "BUSY":
+        return {"ok": False, "error": "not_busy", "state": pre["state"]}
+    tmux_send(target, "Escape")
+    # Wait for state to flip out of BUSY
+    for _ in range(12):  # 3s
+        time.sleep(0.25)
+        st = get_status(target)
+        if st["state"] != "BUSY":
+            return {"ok": True, "after": st["state"]}
+    return {"ok": False, "error": "still_busy_after_esc"}
+
+
+def clear_input(target: str) -> dict:
+    # First ESC — should produce WAIT_ESC
+    tmux_send(target, "Escape")
+    saw_wait = False
+    for _ in range(8):  # 2s
+        time.sleep(0.25)
+        st = get_status(target)
+        if st["state"] == "WAIT_ESC":
+            saw_wait = True
+            break
+    # Second ESC regardless (idempotent if input was already empty)
+    tmux_send(target, "Escape")
+    time.sleep(0.5)
+    st = get_status(target)
+    return {
+        "ok": st["state"] in ("IDLE",),
+        "saw_wait_esc": saw_wait,
+        "after": st["state"],
+        "bottom_bar": st["bottom_bar"],
+    }
+
+
+def auto(target: str) -> dict:
+    st = get_status(target)
+    if st["state"] == "BUSY":
+        return interrupt(target)
+    return clear_input(target)
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog="orch-esc")
+    p.add_argument("target")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--interrupt", action="store_true")
+    g.add_argument("--clear-input", action="store_true")
+    args = p.parse_args(argv[1:])
+
+    if args.interrupt:
+        result = interrupt(args.target)
+    elif args.clear_input:
+        result = clear_input(args.target)
+    else:
+        result = auto(args.target)
+
+    print(json.dumps(result, ensure_ascii=False))
+    if not result.get("ok"):
+        sys.exit(3)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

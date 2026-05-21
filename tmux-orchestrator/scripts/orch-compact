@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""
+orch-compact — Run the full pre-checkpoint + /compact + resume protocol.
+
+This is the most invasive script in the skill: it explicitly drives the
+worker through context compaction. Misuse can destroy session state.
+
+Phases:
+  1. PRE-CHECKPOINT
+     • Verify worker is IDLE
+     • Send [PRE_COMPACT] message asking it to update .orch/checkpoint.md
+     • Wait for completion (orch-wait-completion COMPLETED) AND
+       grep dev_log.md tail for "READY_FOR_COMPACT" AND
+       verify checkpoint.md mtime is within the last N seconds
+
+  2. COMPACT
+     • Send the literal "/compact" slash command via tmux send-keys
+     • Wait for state to flip BUSY then back IDLE (compact in progress)
+     • This may take 30-120s depending on conversation size
+
+  3. RESUME-VERIFY
+     • Send a short verification prompt asking worker to read
+       checkpoint.md and confirm context
+     • Wait for COMPLETED
+     • Grep dev_log.md tail for "RESUMED_OK"
+     • If verification fails, exit non-zero — orchestrator should
+       escalate to user
+
+Usage:
+    orch-compact <target>
+        [--checkpoint-path .orch/checkpoint.md]
+        [--dev-log-path .orch/dev_log.md]
+        [--max-pre-checkpoint-s 300]
+        [--max-compact-s 300]
+        [--max-resume-s 120]
+
+Exit codes:
+    0  full round-trip succeeded
+    2  pre-checkpoint phase failed (worker did not write checkpoint
+       or did not produce READY_FOR_COMPACT)
+    3  compact phase failed (BUSY never reached, or never returned IDLE)
+    4  resume verification failed
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ORCH_STATUS = os.path.join(HERE, "orch-status")
+ORCH_SEND = os.path.join(HERE, "orch-send")
+ORCH_WAIT = os.path.join(HERE, "orch-wait-completion")
+
+
+def status(target):
+    out = subprocess.run([ORCH_STATUS, target], check=True, capture_output=True, text=True)
+    return json.loads(out.stdout)
+
+
+def send_text(target, text):
+    out = subprocess.run(
+        [ORCH_SEND, target, "--text", text], capture_output=True, text=True
+    )
+    return json.loads(out.stdout)
+
+
+def wait_completion(target, marker_before, timeout, poll=3):
+    out = subprocess.run(
+        [
+            ORCH_WAIT, target,
+            "--marker-before", marker_before,
+            "--timeout", str(timeout),
+            "--poll", str(poll),
+        ],
+        capture_output=True, text=True,
+    )
+    return json.loads(out.stdout)
+
+
+def grep_tail(path, pattern, n=50):
+    if not os.path.exists(path):
+        return False
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().splitlines()[-n:]
+    return any(re.search(pattern, line) for line in lines)
+
+
+def tmux_send_slash_compact(target):
+    """Send the literal `/compact` command and Enter."""
+    subprocess.run(["tmux", "send-keys", "-t", target, "/compact"], check=True)
+    time.sleep(0.5)
+    subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=True)
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog="orch-compact")
+    p.add_argument("target")
+    p.add_argument("--checkpoint-path", default=".orch/checkpoint.md")
+    p.add_argument("--dev-log-path", default=".orch/dev_log.md")
+    p.add_argument("--max-pre-checkpoint-s", type=int, default=300)
+    p.add_argument("--max-compact-s", type=int, default=300)
+    p.add_argument("--max-resume-s", type=int, default=120)
+    args = p.parse_args(argv[1:])
+
+    # --- PHASE 1: PRE-CHECKPOINT ---
+    pre = status(args.target)
+    if pre["state"] != "IDLE":
+        print(json.dumps({"phase": "pre-checkpoint", "ok": False, "error": "worker_not_idle", "state": pre["state"]}))
+        sys.exit(2)
+
+    checkpoint_mtime_before = (
+        os.path.getmtime(args.checkpoint_path)
+        if os.path.exists(args.checkpoint_path)
+        else 0
+    )
+
+    ack = send_text(
+        args.target,
+        "[PRE_COMPACT] Update .orch/checkpoint.md so a fresh you can resume "
+        "from it after /compact. Then append 'READY_FOR_COMPACT' to "
+        ".orch/dev_log.md and stop."
+    )
+    if not ack.get("ok"):
+        print(json.dumps({"phase": "pre-checkpoint", "ok": False, "error": "send_failed", "detail": ack}))
+        sys.exit(2)
+    marker = ack["marker_before"]
+
+    res = wait_completion(args.target, marker, timeout=args.max_pre_checkpoint_s)
+    if res.get("outcome") not in ("COMPLETED", "COMPLETED_UNCERTAIN"):
+        print(json.dumps({"phase": "pre-checkpoint", "ok": False, "error": "no_completion", "detail": res}))
+        sys.exit(2)
+
+    # Verify checkpoint.md was actually written
+    if not os.path.exists(args.checkpoint_path):
+        print(json.dumps({"phase": "pre-checkpoint", "ok": False, "error": "checkpoint_missing"}))
+        sys.exit(2)
+    checkpoint_mtime_after = os.path.getmtime(args.checkpoint_path)
+    if checkpoint_mtime_after <= checkpoint_mtime_before:
+        print(json.dumps({
+            "phase": "pre-checkpoint", "ok": False,
+            "error": "checkpoint_not_updated",
+            "mtime_before": checkpoint_mtime_before,
+            "mtime_after": checkpoint_mtime_after,
+        }))
+        sys.exit(2)
+
+    # Verify dev_log marker
+    if not grep_tail(args.dev_log_path, r"READY_FOR_COMPACT", n=20):
+        print(json.dumps({
+            "phase": "pre-checkpoint", "ok": False,
+            "error": "ready_marker_missing",
+            "detail": "Worker did not append READY_FOR_COMPACT to dev_log.md",
+        }))
+        sys.exit(2)
+
+    # --- PHASE 2: /compact ---
+    pre_marker = status(args.target).get("last_completion_hash")
+    tmux_send_slash_compact(args.target)
+    # Wait for it to start
+    busy_seen = False
+    t0 = time.time()
+    while time.time() - t0 < 10:
+        time.sleep(0.5)
+        st = status(args.target)
+        if st["state"] == "BUSY":
+            busy_seen = True
+            break
+
+    # Wait for it to finish (state returns to IDLE)
+    t0 = time.time()
+    while time.time() - t0 < args.max_compact_s:
+        time.sleep(2)
+        st = status(args.target)
+        if st["state"] == "IDLE":
+            break
+    else:
+        print(json.dumps({"phase": "compact", "ok": False, "error": "compact_did_not_finish", "busy_seen": busy_seen}))
+        sys.exit(3)
+
+    # --- PHASE 3: RESUME-VERIFY ---
+    pre_resume = status(args.target)
+    ack = send_text(
+        args.target,
+        "Read .orch/checkpoint.md and the most recent few lines of "
+        ".orch/dev_log.md, then append 'RESUMED_OK <one-line summary of "
+        "where we are>' to .orch/dev_log.md and stop. Do not start any "
+        "task; just confirm orientation."
+    )
+    if not ack.get("ok"):
+        print(json.dumps({"phase": "resume", "ok": False, "error": "send_failed", "detail": ack}))
+        sys.exit(4)
+    res = wait_completion(args.target, ack["marker_before"], timeout=args.max_resume_s)
+    if res.get("outcome") not in ("COMPLETED", "COMPLETED_UNCERTAIN"):
+        print(json.dumps({"phase": "resume", "ok": False, "error": "no_completion", "detail": res}))
+        sys.exit(4)
+    if not grep_tail(args.dev_log_path, r"RESUMED_OK", n=20):
+        print(json.dumps({"phase": "resume", "ok": False, "error": "resumed_marker_missing"}))
+        sys.exit(4)
+
+    print(json.dumps({
+        "ok": True,
+        "checkpoint_mtime": checkpoint_mtime_after,
+        "compact_busy_seen": busy_seen,
+    }))
+
+
+if __name__ == "__main__":
+    main(sys.argv)

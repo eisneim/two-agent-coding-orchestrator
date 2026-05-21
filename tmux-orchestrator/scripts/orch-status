@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""
+orch-status — Classify the state of a Claude Code worker running in a tmux session.
+
+Emits a small JSON object describing what the worker is doing right now.
+Designed to be the ONLY way the orchestrator observes the worker, so that
+orchestrator context stays small (~10 fields per call, no raw screen text).
+
+Usage:
+    orch-status <tmux-session-or-target>
+
+Output JSON fields:
+    state            "IDLE" | "BUSY" | "WAIT_ESC" | "TRANSCRIPT" | "UNKNOWN"
+    phase            "thinking" | "generating" | "tool" | null
+                     (only meaningful when state == BUSY)
+    elapsed_s        Current turn's elapsed seconds (int), or null
+    tokens           Current turn's reported token count (int), or null
+    token_dir        "up" | "down" | null  (↑ uploading / ↓ downloading)
+    last_completion  e.g. "Brewed for 26s", or null if none in scrollback
+    last_completion_hash  sha1 of last_completion (stable marker for diff)
+    bg_shells        int, count of background shells still running
+    error_detected   "424" | "network" | "api_error" | null
+    bypass_mode      bool, true if bottom bar shows bypass permissions
+    bottom_bar       the bottom-most bar line (for debugging only)
+
+Exit codes:
+    0  ok
+    1  tmux session not found
+    2  internal error
+
+Reference: ~/.claude/skills/tmux-orchestrator/findings.md
+"""
+
+import json
+import re
+import subprocess
+import sys
+import hashlib
+
+
+def capture_pane(target: str, lines: int = 2000) -> str:
+    """Capture last N lines of the given tmux pane/session, no colors.
+
+    We capture aggressively (2000 lines) because long worker outputs can
+    push the completion-marker line (`Verb for Xs`) far up the scrollback.
+    Cost is small: tmux capture-pane is O(lines) and we only do it once
+    per status call.
+    """
+    try:
+        out = subprocess.run(
+            ["tmux", "capture-pane", "-t", target, "-p", "-S", f"-{lines}", "-E", "-"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return out.stdout
+    except subprocess.CalledProcessError as e:
+        # session not found, etc.
+        err = (e.stderr or "").strip()
+        print(json.dumps({"error": "capture_failed", "detail": err}), file=sys.stderr)
+        sys.exit(1)
+
+
+# Regexes
+# Status line during BUSY, e.g.
+#   "✢ Twisting… (39s · ↓ 415 tokens)"
+#   "✳ Sautéing… (25s · ↑ 80 tokens · thinking more with xhigh effort)"
+#   "· Catapulting… (15s · ↑ 181 tokens · still thinking with xhigh effort)"
+#   "✻ Manifesting…"                              (very first frame, no time yet)
+STATUS_LINE_RE = re.compile(
+    r"""
+    ^\s*
+    (?P<glyph>[^\s\w]+)?      # leading glyph (✻ ✽ ✳ ✢ · ✶ etc), optional
+    \s*
+    (?P<verb>[A-Z][a-zA-Zé]+)…   # in-progress verb ends with …
+    (?:\s*\(
+        (?P<elapsed>\d+)s
+        (?:\s*·\s*(?P<dir>[↑↓])\s*(?P<tokens>[\d.]+)k?\s*tokens)?
+        (?:\s*·\s*(?P<thinking>(?:still\s+|more\s+)?thinking[^)]*))?
+    \))?
+    \s*$
+    """,
+    re.VERBOSE,
+)
+
+# Completion line, e.g. "✻ Brewed for 26s" or "✻ Sautéed for 16s · 1 shell still running"
+COMPLETION_LINE_RE = re.compile(
+    r"""
+    ^\s*
+    (?:[^\s\w]+\s+)?                 # optional glyph
+    (?P<verb>[A-Z][a-zA-Zé]+)\s+for\s+(?P<elapsed>\d+)s
+    (?:\s*·\s*(?P<bg>\d+)\s+shell)?  # optional background shell suffix
+    .*$
+    """,
+    re.VERBOSE,
+)
+
+
+def classify(screen: str) -> dict:
+    """Classify the current worker state from a captured pane."""
+    lines = screen.rstrip("\n").split("\n")
+    # Inspect the last ~6 lines as the "footer region". The very last line
+    # is usually the status bar, BUT after some events (e.g. interruption)
+    # the status bar can be pushed off-screen and the last line is just a
+    # box separator. So we scan the footer for any of the known signals.
+    footer_lines = [l for l in lines[-6:] if l.strip()]
+    footer_blob = "\n".join(footer_lines)
+    bottom_bar = footer_lines[-1] if footer_lines else ""
+
+    result = {
+        "state": "UNKNOWN",
+        "phase": None,
+        "elapsed_s": None,
+        "tokens": None,
+        "token_dir": None,
+        "last_completion": None,
+        "last_completion_hash": None,
+        "bg_shells": 0,
+        "error_detected": None,
+        "bypass_mode": False,
+        "bottom_bar": bottom_bar.strip(),
+        "screen_hash": hashlib.sha1(screen.encode("utf-8", "replace")).hexdigest()[:12],
+        "interrupted_marker_seen": False,
+        "dialog_present": False,
+    }
+
+    # --- 1. State by footer signals (findings.md §1, §2)
+    # Order matters: BUSY check first (esc to interrupt is unambiguous).
+    if "esc to interrupt" in footer_blob:
+        result["state"] = "BUSY"
+    elif "Esc again to clear" in footer_blob:
+        result["state"] = "WAIT_ESC"
+    elif "Showing detailed transcript" in footer_blob:
+        result["state"] = "TRANSCRIPT"
+    else:
+        # Anything else (including the case where the bar is pushed
+        # off-screen by a long input box) is treated as IDLE — i.e.
+        # "not actively working". This is the safe interpretation.
+        result["state"] = "IDLE"
+
+    if "bypass permissions on" in footer_blob:
+        result["bypass_mode"] = True
+
+    # --- 2. If BUSY, parse status line (findings.md §3)
+    if result["state"] == "BUSY":
+        # Find the status line. It typically appears within the last ~10 lines
+        # before the input box separators. Scan upward for a line matching
+        # STATUS_LINE_RE that contains an in-progress verb ending in '…'.
+        status_match = None
+        for line in reversed(lines[-30:]):
+            if "…" in line:
+                m = STATUS_LINE_RE.match(line)
+                if m:
+                    status_match = m
+                    break
+        if status_match:
+            d = status_match.groupdict()
+            if d.get("elapsed"):
+                result["elapsed_s"] = int(d["elapsed"])
+            if d.get("tokens"):
+                # tokens field may be "415" or "4.1" (kilo); we report integer
+                tok = d["tokens"]
+                try:
+                    if "." in tok:
+                        result["tokens"] = int(float(tok) * 1000)
+                    else:
+                        result["tokens"] = int(tok)
+                except ValueError:
+                    result["tokens"] = None
+            if d.get("dir"):
+                result["token_dir"] = "up" if d["dir"] == "↑" else "down"
+            # phase classification
+            thinking = d.get("thinking")
+            if thinking:
+                result["phase"] = "thinking"
+            elif d.get("dir") == "↓":
+                result["phase"] = "generating"
+            elif d.get("dir") == "↑":
+                result["phase"] = "tool"
+            else:
+                # status line present but no token info → very early in turn
+                result["phase"] = "thinking"
+
+    # --- 3. Last completion marker (findings.md §5)
+    # Hash MUST be based only on stable fields, NOT the verb, because
+    # Claude Code re-renders verbs as part of UI animation; the same
+    # turn may show as "Churned for 23s" in one frame and "Cooked for
+    # 23s" in another. The integer elapsed_s and bg-shells suffix are
+    # stable. We additionally include a counter of how many completion
+    # lines exist up to and including this one, so the marker changes
+    # when a NEW completion appears (even if the elapsed is the same as
+    # the previous turn).
+    completion_count = 0
+    for line in lines:
+        if COMPLETION_LINE_RE.match(line):
+            completion_count += 1
+    # Find last
+    for line in reversed(lines):
+        m = COMPLETION_LINE_RE.match(line)
+        if m:
+            elapsed = m.group("elapsed")
+            bg = m.group("bg")
+            marker_str = f"completion#{completion_count}/for_{elapsed}s"
+            if bg:
+                marker_str += f"/bg_{bg}"
+                result["bg_shells"] = int(bg)
+            # last_completion human label retains the verb for display
+            verb = m.group("verb")
+            display = f"{verb} for {elapsed}s"
+            if bg:
+                display += f" · {bg} shell still running"
+            result["last_completion"] = display
+            result["last_completion_hash"] = hashlib.sha1(
+                marker_str.encode("utf-8")
+            ).hexdigest()[:12]
+            break
+
+    # --- 4. Error detection (findings.md §12 — unverified, best effort)
+    tail_blob = "\n".join(lines[-20:])
+    if "424" in tail_blob:
+        result["error_detected"] = "424"
+    elif re.search(r"Connection error|connection reset|network error", tail_blob, re.I):
+        result["error_detected"] = "network"
+    elif re.search(r"API Error|api error", tail_blob, re.I):
+        result["error_detected"] = "api_error"
+
+    # --- 5. Interrupt sentinel (findings.md §5a)
+    # Look across the whole capture (not just tail) — the line may be
+    # well above the input box if more output came after the interrupt.
+    if re.search(r"Interrupted\s*·\s*What should Claude do instead", screen):
+        result["interrupted_marker_seen"] = True
+
+    # --- 6. Feedback / survey dialog (findings.md §12)
+    # The dialog intercepts the next keystroke. We must detect and dismiss
+    # before any send.
+    if "How is Claude doing this session" in tail_blob or re.search(
+        r"●\s+How is Claude", screen
+    ):
+        result["dialog_present"] = True
+
+    return result
+
+
+def main(argv):
+    if len(argv) != 2:
+        print("usage: orch-status <tmux-target>", file=sys.stderr)
+        sys.exit(2)
+    target = argv[1]
+    screen = capture_pane(target)
+    result = classify(screen)
+    print(json.dumps(result, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main(sys.argv)

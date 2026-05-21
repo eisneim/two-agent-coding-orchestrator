@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""
+orch-wait-completion — Block until a worker turn ends, classify the outcome.
+
+This is the single most important orchestrator primitive after orch-send.
+It distinguishes:
+  - COMPLETED    : new completion marker appeared (task finished cleanly)
+  - INTERRUPTED  : returned to IDLE without a new marker (esc / failure)
+  - STALLED      : stayed BUSY too long with no observable progress
+  - ERROR        : status reports error_detected (424 / network / api_error)
+  - TIMEOUT      : exceeded overall --timeout (rare; safety net)
+
+Usage:
+    orch-wait-completion <target> \
+        --marker-before <hash> \
+        [--timeout 1800] \
+        [--stall-after 600] \
+        [--poll 5]
+
+Outputs JSON with: outcome, elapsed_s_total, last_status, marker_after.
+
+Stall heuristic:
+  We're "stalled" if state has been BUSY for `stall-after` seconds AND
+  both (status-line elapsed_s) and (screen_hash) have not advanced for
+  the last `stall-after / 3` seconds. The screen_hash fallback covers
+  the heavy-streaming case where status line is absent.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ORCH_STATUS = os.path.join(HERE, "orch-status")
+
+
+def status(target):
+    out = subprocess.run(
+        [ORCH_STATUS, target], check=True, capture_output=True, text=True
+    )
+    return json.loads(out.stdout)
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog="orch-wait-completion")
+    p.add_argument("target")
+    p.add_argument("--marker-before", required=True,
+                   help="last_completion_hash value before the prompt was sent")
+    p.add_argument("--timeout", type=int, default=1800,
+                   help="overall timeout in seconds (default 1800 = 30min)")
+    p.add_argument("--stall-after", type=int, default=600,
+                   help="seconds of BUSY-no-progress before declaring STALLED")
+    p.add_argument("--poll", type=float, default=5.0,
+                   help="seconds between status polls")
+    p.add_argument("--screen-hash-before",
+                   help="screen_hash captured at send time, for distinguishing "
+                        "pre-existing 'Interrupted' markers in scrollback")
+    args = p.parse_args(argv[1:])
+
+    marker_before = args.marker_before
+    t_start = time.time()
+    last_busy_progress_t = t_start
+    last_screen_hash = None
+    last_status_elapsed = None
+    last_st = None
+
+    # Snapshot the "interrupted" presence at start; if it later flips
+    # false→true, the current prompt was interrupted. If it was already
+    # true at start (from an older interrupt in scrollback) we need a
+    # different heuristic.
+    initial_st = status(args.target)
+    interrupted_seen_initially = initial_st.get("interrupted_marker_seen", False)
+
+    while True:
+        now = time.time()
+        if now - t_start > args.timeout:
+            print(json.dumps({
+                "outcome": "TIMEOUT",
+                "elapsed_s_total": int(now - t_start),
+                "last_status": last_st,
+            }))
+            sys.exit(0)
+
+        st = status(args.target)
+        last_st = st
+
+        # ERROR shortcuts (Phase 3 wires the recovery)
+        if st.get("error_detected"):
+            print(json.dumps({
+                "outcome": "ERROR",
+                "error": st["error_detected"],
+                "elapsed_s_total": int(now - t_start),
+                "last_status": st,
+            }))
+            sys.exit(0)
+
+        if st["state"] == "BUSY":
+            # progress detection: status-line elapsed advanced, OR screen changed
+            advanced = False
+            if st.get("elapsed_s") is not None:
+                if last_status_elapsed is None or st["elapsed_s"] > last_status_elapsed:
+                    advanced = True
+                    last_status_elapsed = st["elapsed_s"]
+            if st.get("screen_hash") != last_screen_hash:
+                advanced = True
+                last_screen_hash = st["screen_hash"]
+            if advanced:
+                last_busy_progress_t = now
+
+            if now - last_busy_progress_t > args.stall_after:
+                print(json.dumps({
+                    "outcome": "STALLED",
+                    "elapsed_s_total": int(now - t_start),
+                    "stuck_for_s": int(now - last_busy_progress_t),
+                    "last_status": st,
+                }))
+                sys.exit(0)
+
+        elif st["state"] == "IDLE":
+            # Check for fresh interrupt sentinel first (flipped to True
+            # while we were watching, OR initially false).
+            interrupt_fresh = (
+                st.get("interrupted_marker_seen", False)
+                and not interrupted_seen_initially
+            )
+
+            new_marker = st.get("last_completion_hash")
+            marker_changed = bool(new_marker) and new_marker != marker_before
+
+            if marker_changed and not interrupt_fresh:
+                print(json.dumps({
+                    "outcome": "COMPLETED",
+                    "elapsed_s_total": int(now - t_start),
+                    "marker_after": new_marker,
+                    "last_completion": st.get("last_completion"),
+                    "bg_shells": st.get("bg_shells", 0),
+                }))
+                sys.exit(0)
+
+            if interrupt_fresh:
+                # Confirm with one more poll to avoid race
+                time.sleep(args.poll)
+                st2 = status(args.target)
+                if st2["state"] == "IDLE" and st2.get("interrupted_marker_seen", False):
+                    print(json.dumps({
+                        "outcome": "INTERRUPTED",
+                        "elapsed_s_total": int(time.time() - t_start),
+                        "reason": "interrupt_sentinel_visible",
+                        "last_status": st2,
+                    }))
+                    sys.exit(0)
+                continue
+
+            # If marker is null, the completion line scrolled off-screen
+            # (heavy long output). We cannot tell COMPLETED from INTERRUPTED
+            # purely from the marker. Heuristic: if at any point during this
+            # wait we DID observe BUSY + progress, the worker actually ran;
+            # treat it as COMPLETED-UNCERTAIN. Otherwise INTERRUPTED.
+            if new_marker is None:
+                outcome = "COMPLETED_UNCERTAIN" if last_screen_hash is not None else "INTERRUPTED"
+                time.sleep(args.poll)
+                st2 = status(args.target)
+                if st2["state"] == "IDLE":
+                    print(json.dumps({
+                        "outcome": outcome,
+                        "elapsed_s_total": int(time.time() - t_start),
+                        "reason": "marker_scrolled_offscreen" if outcome == "COMPLETED_UNCERTAIN" else "no_busy_observed",
+                        "last_status": st2,
+                    }))
+                    sys.exit(0)
+                continue
+
+            # Marker unchanged: confirm INTERRUPTED with extra poll
+            time.sleep(args.poll)
+            st2 = status(args.target)
+            if st2["state"] == "IDLE" and st2.get("last_completion_hash") == marker_before:
+                print(json.dumps({
+                    "outcome": "INTERRUPTED",
+                    "elapsed_s_total": int(time.time() - t_start),
+                    "reason": "marker_unchanged",
+                    "last_status": st2,
+                }))
+                sys.exit(0)
+            # Otherwise loop continues with refreshed status
+
+        elif st["state"] == "WAIT_ESC":
+            # Transient — let it settle; do not treat as terminal
+            pass
+
+        time.sleep(args.poll)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

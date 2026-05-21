@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""
+selftest — End-to-end verification of orch-status / orch-send / orch-esc
+against a live Claude Code worker.
+
+Replays scenarios #1–#10 from findings.md and asserts JSON outputs are
+sensible. Not a unit test; this drives a real worker so it takes ~3 min.
+
+Usage:
+    selftest <tmux-target>     # default: test_cc
+
+Pre-conditions:
+  - The given tmux session must have a `claude` worker already running
+    and IDLE.
+  - Worker should be in normal (non-bypass) mode for clean runs, but
+    selftest tolerates bypass.
+
+Exit codes:
+    0   all scenarios passed
+    1   at least one assertion failed (details printed to stderr)
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ORCH_STATUS = os.path.join(HERE, "orch-status")
+ORCH_SEND = os.path.join(HERE, "orch-send")
+ORCH_ESC = os.path.join(HERE, "orch-esc")
+ORCH_WAIT = os.path.join(HERE, "orch-wait-completion")
+ORCH_RETRY = os.path.join(HERE, "orch-retry")
+
+
+class TestFail(Exception):
+    pass
+
+
+def status(target):
+    out = subprocess.run([ORCH_STATUS, target], check=True, capture_output=True, text=True)
+    return json.loads(out.stdout)
+
+
+def send(target, text):
+    out = subprocess.run([ORCH_SEND, target, "--text", text], capture_output=True, text=True)
+    return json.loads(out.stdout)
+
+
+def esc(target):
+    out = subprocess.run([ORCH_ESC, target], capture_output=True, text=True)
+    return json.loads(out.stdout)
+
+
+def wait_completion(target, marker_before, timeout=60, poll=2):
+    out = subprocess.run(
+        [ORCH_WAIT, target, "--marker-before", marker_before,
+         "--timeout", str(timeout), "--poll", str(poll)],
+        capture_output=True, text=True,
+    )
+    return json.loads(out.stdout)
+
+
+def retry(target):
+    proc = subprocess.run([ORCH_RETRY, target], capture_output=True, text=True)
+    return json.loads(proc.stdout), proc.returncode
+
+
+def wait_state(target, want_state, timeout=30):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        s = status(target)
+        if s["state"] == want_state:
+            return s
+        time.sleep(0.5)
+    raise TestFail(f"timeout waiting for state={want_state}, last={s}")
+
+
+def wait_idle_with_new_marker(target, marker_before, timeout=120):
+    """Wait until IDLE AND last_completion_hash differs from marker_before."""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        s = status(target)
+        if s["state"] == "IDLE" and s.get("last_completion_hash") and s["last_completion_hash"] != marker_before:
+            return s
+        time.sleep(0.5)
+    raise TestFail(f"timeout waiting for new completion, last={s}")
+
+
+def assert_eq(actual, expected, label):
+    if actual != expected:
+        raise TestFail(f"{label}: expected {expected!r}, got {actual!r}")
+
+
+def assert_in(needle, haystack, label):
+    if needle not in haystack:
+        raise TestFail(f"{label}: {needle!r} not in {haystack!r}")
+
+
+PASS = "PASS"
+FAIL = "FAIL"
+
+
+def run(label, fn):
+    print(f"[{label}] running...", flush=True)
+    try:
+        fn()
+        print(f"  {PASS}")
+        return True
+    except TestFail as e:
+        print(f"  {FAIL}: {e}", file=sys.stderr)
+        return False
+
+
+def main(argv):
+    target = argv[1] if len(argv) > 1 else "test_cc"
+
+    # Sanity: target must exist & be IDLE
+    s = status(target)
+    if s["state"] != "IDLE":
+        # Try to clear
+        esc(target)
+        time.sleep(1)
+        s = status(target)
+        if s["state"] != "IDLE":
+            print(f"FAIL: precondition — worker must be IDLE, got {s}", file=sys.stderr)
+            sys.exit(1)
+
+    results = []
+
+    # --- Scenario #1: idle classification ---
+    def t1():
+        s = status(target)
+        assert_eq(s["state"], "IDLE", "S1 state")
+        assert_eq(s["phase"], None, "S1 phase")
+
+    results.append(run("S1 idle", t1))
+
+    # --- Scenario #2/#3/#4: short generation -> COMPLETED ---
+    def t2():
+        before = status(target)["last_completion_hash"]
+        ack = send(target, "说一句你好")
+        assert_eq(ack["ok"], True, "S2 send ok")
+        # Wait for new marker
+        s = wait_idle_with_new_marker(target, before, timeout=60)
+        # Verify marker actually changed (= task COMPLETED, not interrupted)
+        if s["last_completion_hash"] == before:
+            raise TestFail("S2 marker did not change — task was interrupted?")
+
+    results.append(run("S2 send-and-complete (short)", t2))
+
+    # --- Scenario #5: ESC interrupt -> NO new marker ---
+    # We need a task that's guaranteed to keep the worker BUSY long enough
+    # for our ESC to land. Foreground bash `sleep N` (no chained command)
+    # keeps the bash tool BUSY for the full duration; the worker stays
+    # blocked on its tool call.
+    def t5():
+        before = status(target)["last_completion_hash"]
+        ack = send(target, "请用 bash 工具运行命令: sleep 20")
+        assert_eq(ack["ok"], True, "S5 send ok")
+        # Wait until BUSY and a few seconds into the tool call
+        for _ in range(40):  # 10s max
+            time.sleep(0.25)
+            s = status(target)
+            if s["state"] == "BUSY":
+                break
+        else:
+            raise TestFail(f"S5 expected BUSY, got {s}")
+        time.sleep(4)
+        s = status(target)
+        if s["state"] != "BUSY":
+            raise TestFail(f"S5 worker exited BUSY too fast; got {s['state']}. "
+                           f"Fixture may have refused the sleep command.")
+        e = esc(target)
+        assert_eq(e["ok"], True, "S5 esc ok")
+        time.sleep(2)
+        s = status(target)
+        assert_eq(s["state"], "IDLE", "S5 post-esc state")
+        if s["last_completion_hash"] != before:
+            # Capture pane dump for diagnosis
+            cap = subprocess.run(
+                ["tmux", "capture-pane", "-t", target, "-p"],
+                capture_output=True, text=True
+            ).stdout
+            tail = "\n".join(cap.splitlines()[-15:])
+            raise TestFail(
+                f"S5 marker changed after interrupt — should have stayed at {before}, "
+                f"got {s['last_completion_hash']} ({s['last_completion']}); "
+                f"interrupted_marker_seen={s.get('interrupted_marker_seen')}\n"
+                f"Pane tail:\n{tail}"
+            )
+
+    results.append(run("S5 esc-interrupt", t5))
+
+    # Cleanup: clear any lingering prompt in input box
+    esc(target)
+
+    # --- Scenario #7: empty Enter is no-op ---
+    def t7():
+        before = status(target)["last_completion_hash"]
+        # Send Enter directly via tmux (skip orch-send because empty rejection)
+        subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=True)
+        time.sleep(2)
+        s = status(target)
+        assert_eq(s["state"], "IDLE", "S7 state after empty Enter")
+        if s["last_completion_hash"] != before:
+            raise TestFail("S7 empty Enter triggered a turn? marker changed")
+
+    results.append(run("S7 empty-enter", t7))
+
+    # --- Scenario #3+#10: tool call -> COMPLETED ---
+    def t10():
+        before = status(target)["last_completion_hash"]
+        ack = send(target, "用 bash 跑 echo selftest_token_42")
+        assert_eq(ack["ok"], True, "S10 send ok")
+        s = wait_idle_with_new_marker(target, before, timeout=60)
+        if s["last_completion_hash"] == before:
+            raise TestFail("S10 marker did not change")
+
+    results.append(run("S10 tool-call complete", t10))
+
+    # --- Long-prompt submission stress test ---
+    def t_long():
+        before = status(target)["last_completion_hash"]
+        long_prompt = (
+            "1. 列出当前目录的文件 "
+            "2. 创建文件 /tmp/selftest_a.txt 内容是 hello "
+            "3. cat 这个文件 "
+            "4. 删除这个文件 "
+            "5. 简短报告每步结果"
+        )
+        ack = send(target, long_prompt)
+        assert_eq(ack["ok"], True, "long send ok")
+        # attempts should be 1 in our environment, but allow up to 3
+        if ack["attempts"] > 3:
+            raise TestFail(f"long submit took {ack['attempts']} attempts")
+        s = wait_idle_with_new_marker(target, before, timeout=120)
+        if s["last_completion_hash"] == before:
+            raise TestFail("long task marker did not change")
+
+    results.append(run("long-prompt submission", t_long))
+
+    # --- wait-completion: COMPLETED outcome ---
+    def t_wait_completed():
+        before = status(target)["last_completion_hash"]
+        ack = send(target, "说一句你好")
+        assert_eq(ack["ok"], True, "send")
+        res = wait_completion(target, ack["marker_before"], timeout=30)
+        assert_eq(res["outcome"], "COMPLETED", "wait outcome")
+        if res["marker_after"] == before:
+            raise TestFail("marker_after equals marker_before")
+
+    results.append(run("wait-completion COMPLETED", t_wait_completed))
+
+    # --- wait-completion: INTERRUPTED via ESC ---
+    def t_wait_interrupted():
+        esc(target)
+        time.sleep(1)
+        before = status(target)["last_completion_hash"]
+        ack = send(target, "请用 bash 工具运行命令: sleep 20")
+        assert_eq(ack["ok"], True, "send")
+        for _ in range(40):
+            time.sleep(0.25)
+            s = status(target)
+            if s["state"] == "BUSY":
+                break
+        else:
+            raise TestFail(f"expected BUSY, got {s['state']}")
+        time.sleep(4)
+        e = esc(target)
+        assert_eq(e["ok"], True, "esc")
+        res = wait_completion(target, ack["marker_before"], timeout=30)
+        if res["outcome"] not in ("INTERRUPTED",):
+            raise TestFail(f"expected INTERRUPTED, got {res['outcome']}: {res}")
+
+    results.append(run("wait-completion INTERRUPTED", t_wait_interrupted))
+
+    # Cleanup leftover prompt
+    esc(target)
+
+    # --- orch-retry refuses when no error ---
+    def t_retry_refuses():
+        info, code = retry(target)
+        assert_eq(info.get("ok"), False, "retry without error must refuse")
+        assert_eq(code, 2, "exit code should be 2 (precondition)")
+        assert_eq(info.get("error"), "no_error_detected", "error reason")
+
+    results.append(run("retry refuses without error", t_retry_refuses))
+
+    print()
+    passed = sum(results)
+    total = len(results)
+    print(f"=== {passed}/{total} passed ===")
+    sys.exit(0 if passed == total else 1)
+
+
+if __name__ == "__main__":
+    main(sys.argv)
